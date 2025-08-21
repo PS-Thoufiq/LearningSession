@@ -1,139 +1,300 @@
 pipeline {
+
     agent any
+
     tools {
+
         maven 'Maven-3.9.11'
+
         jdk 'JDK 21 '
+
     }
+
     environment {
+
         APP_NAME = "LearningSession"
-        BETA_PORT = 8081
-        GAMMA_PORT = 8082
-        PROD_PORT = 8083
+
+        BETA_PORT = 8092
+
+        GAMMA_PORT = 8093
+
         SERVER_IP = "localhost"
+
         LOG_DIR = "${WORKSPACE}/logs"
-        DOCKER_IMAGE = "thoufiqzeero/learning_session"
+
+        DOCKER_IMAGE = "thoufiq_learning_session"
+
         DOCKER_TAG = "${env.BUILD_NUMBER}"
+
+        BETA_URL = "http://${SERVER_IP}:${BETA_PORT}"
+
+        GAMMA_URL = "http://${SERVER_IP}:${GAMMA_PORT}"
+
+        PROD_URL = "http://${SERVER_IP}:${PROD_PORT}"
+
     }
+
     stages {
-        stage("Verify Docker Access") {
+
+        stage('Checkout Main Repo') {
+
             steps {
-                script {
-                    try {
-                        sh 'docker ps'
-                        echo "Docker access verified"
-                    } catch (Exception e) {
-                        error "Docker not accessible. Ensure Jenkins user has Docker permissions (sudo usermod -aG docker jenkins)"
-                    }
-                }
-            }
-        }
-        stage ("Checkout") {
-            steps {
+
                 git url: 'https://github.com/puli-reddy/LearningSession.git', branch: 'main'
+
                 sh 'chmod +x mvnw'
+
             }
+
         }
-        stage ("Create Log Directory") {
+
+        stage('Checkout Integration Tests') {
+
             steps {
+
+                dir('integration-tests') {
+
+                    git url: 'https://github.com/puli-reddy/LearningSessionIntegrationTests.git', branch: 'main'
+
+                    sh 'chmod +x mvnw'
+
+                }
+
+            }
+
+        }
+
+        stage('Create Log Directory') {
+
+            steps {
+
                 sh 'mkdir -p ${LOG_DIR}'
+
             }
+
         }
-        stage ("Build") {
+
+        stage('Build') {
+
             steps {
-                sh './mvnw clean package'
+
+                sh './mvnw clean package -DskipTests'
+
             }
+
         }
-        stage ("Build Docker Image") {
+
+        stage('Build Docker Image') {
+
             steps {
+
                 script {
-                    withCredentials([usernamePassword(credentialsId: 'docker-hub-creds', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
-                        sh """
-                            docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
-                        """
-                    }
+
+                    sh "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} ."
+
                 }
+
             }
+
         }
-        stage('Push to Docker Hub') {
+
+        stage('Setup Network') {
+
             steps {
-                script {
-                    withCredentials([usernamePassword(credentialsId: 'docker-hub-creds', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
-                        sh """
-                            echo \$DOCKER_PASSWORD | docker login -u \$DOCKER_USERNAME --password-stdin
-                            docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
-                        """
-                    }
-                }
+
+                sh 'docker network create spring-network || true'
+
             }
+
         }
+
         stage('Deploy to Beta') {
-            when {
-                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
-            }
+
             steps {
+
                 echo "Deploying to Beta environment on port ${BETA_PORT}"
+
                 script {
+
+                    sh "docker rm -f ${APP_NAME}-beta || true"
+
                     sh """
-                        docker rm -f ${APP_NAME}-beta || true
-                    """
-                    sh """
-                        docker run -d --name ${APP_NAME}-beta -p ${BETA_PORT}:${BETA_PORT} \
+
+                        docker run -d --name ${APP_NAME}-beta --network spring-network -p ${BETA_PORT}:${BETA_PORT} \
+
                         -e SPRING_PROFILES_ACTIVE=beta \
+
                         ${DOCKER_IMAGE}:${DOCKER_TAG}
+
                     """
-//                     sleep(time: 60, unit: "SECONDS")
-                    def maxRetries = 3
-                    def retryDelay = 10
-                    echo "Beta is running on http://${SERVER_IP}:${BETA_PORT}/"
-                    sh "docker ps | grep ${APP_NAME}-beta || exit 1"
+
+                    sleep(time: 30, unit: "SECONDS")
+
+                    retry(3) {
+
+                        sh "curl -f ${BETA_URL}/actuator/health || exit 1"
+
+                    }
+
+                    echo "Beta is running on ${BETA_URL}"
+
                 }
+
             }
+
         }
-        stage('Deploy to Gamma') {
-             when {
-                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
-             }
-             steps {
-                echo "Deploying to Gamma environment on port ${GAMMA_PORT}"
-                script {
-                    sh """
-                        docker rm -f ${APP_NAME}-gamma || true
-                    """
-                    sh """
-                        docker run -d --name ${APP_NAME}-gamma -p ${GAMMA_PORT}:${GAMMA_PORT} \
-                        -e SPRING_PROFILES_ACTIVE=gamma \
-                        ${DOCKER_IMAGE}:${DOCKER_TAG}
-                    """
-//                     sleep(time: 60, unit: "SECONDS")
-                    def maxRetries = 3
-                    def retryDelay = 10
-                    echo "Gamma is running on http://${SERVER_IP}:${GAMMA_PORT}/"
-                    sh "docker ps | grep ${APP_NAME}-gamma || exit 1"
-                }
-             }
-        }
-        stage('Deploy to Prod') {
-            when {
-                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
-            }
+
+        stage('Integration Tests on Beta') {
+
             steps {
-                echo "Deploying to Prod environment on port ${PROD_PORT}"
-                script {
+
+                dir('integration-tests') {
+
                     sh """
-                        docker rm -f ${APP_NAME}-prod || true
+
+                        ./mvnw verify -Dspring.profiles.active=beta -Dservice.url=${BETA_URL}
+
+                        if [ -d "target/failsafe-reports" ]; then
+
+                            grep -l "FAILURE" target/failsafe-reports/*.txt && exit 1 || exit 0
+
+                        fi
+
                     """
-                    sh """
-                        docker run -d --name ${APP_NAME}-prod -p ${PROD_PORT}:${PROD_PORT} \
-                        -e SPRING_PROFILES_ACTIVE=prod \
-                        ${DOCKER_IMAGE}:${DOCKER_TAG}
-                    """
-//                     sleep(time: 60, unit: "SECONDS")
-                    def maxRetries = 3
-                    def retryDelay = 10
-                    echo "Prod is running on http://${SERVER_IP}:${PROD_PORT}/"
-                    sh "docker ps | grep ${APP_NAME}-prod || exit 1"
+
                 }
+
             }
+
         }
+
+        stage('Deploy to Gamma') {
+
+            steps {
+
+                echo "Deploying to Gamma environment on port ${GAMMA_PORT}"
+
+                script {
+
+                    sh "docker rm -f ${APP_NAME}-gamma || true"
+
+                    sh """
+
+                        docker run -d --name ${APP_NAME}-gamma --network spring-network -p ${GAMMA_PORT}:${GAMMA_PORT} \
+
+                        -e SPRING_PROFILES_ACTIVE=gamma \
+
+                        ${DOCKER_IMAGE}:${DOCKER_TAG}
+
+                    """
+
+                    sleep(time: 30, unit: "SECONDS")
+
+                    retry(3) {
+
+                        sh "curl -f ${GAMMA_URL}/actuator/health || exit 1"
+
+                    }
+
+                    echo "Gamma is running on ${GAMMA_URL}"
+
+                }
+
+            }
+
+        }
+
+        stage('Approval for Prod') {
+
+            steps {
+
+                input message: 'Integration tests passed. Approve deployment to Prod?', ok: 'Deploy'
+
+            }
+
+        }
+
+        stage('Deploy to Prod') {
+
+            steps {
+
+                echo "Deploying to Prod environment on port ${PROD_PORT}"
+
+                script {
+
+                    sh "docker rm -f ${APP_NAME}-prod || true"
+
+                    sh """
+
+                        docker run -d --name ${APP_NAME}-prod --network spring-network -p ${PROD_PORT}:${PROD_PORT} \
+
+                        -e SPRING_PROFILES_ACTIVE=prod \
+
+                        ${DOCKER_IMAGE}:${DOCKER_TAG}
+
+                    """
+
+                    sleep(time: 30, unit: "SECONDS")
+
+                    retry(3) {
+
+                        sh "curl -f ${PROD_URL}/actuator/health || exit 1"
+
+                    }
+
+                    echo "Prod is running on ${PROD_URL}"
+
+                }
+
+            }
+
+        }
+
     }
+
+    post {
+
+        success {
+
+            echo "Pipeline completed successfully!"
+
+            echo "Beta: ${BETA_URL}"
+
+            echo "Gamma: ${GAMMA_URL}"
+
+            echo "Prod: ${PROD_URL}"
+
+        }
+
+        failure {
+
+            echo "Pipeline failed. Check container logs."
+
+            script {
+
+                sh "docker logs ${APP_NAME}-beta || true"
+
+                sh "docker logs ${APP_NAME}-gamma || true"
+
+                sh "docker logs ${APP_NAME}-prod || true"
+
+            }
+
+        }
+
+        always {
+
+            script {
+
+                sh 'docker logout || true'
+
+                cleanWs()
+
+            }
+
+        }
+
+    }
+
 }
+
